@@ -35,8 +35,26 @@
     import { getFirestore, doc, getDoc, setDoc, collection, onSnapshot, updateDoc, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
     
     // --- Global Variables and Firebase Init Setup ---
+
+    // NOTE FOR GITHUB DEPLOYMENT: 
+    // 如果部署到 GitHub Pages 等公开环境，您必须将下面的占位符替换为您自己的 Firebase 项目配置对象。
+    const USER_FIREBASE_CONFIG = {
+        apiKey: "AIzaSyD5VkzYpa0VnbelrC5tr2jSdzeI7cu8N0A", // <-- 替换为您自己的 API Key
+        authDomain: "my-project-93cf8.firebaseapp.com", // <-- 替换为您自己的 Auth Domain
+        projectId: "my-project-93cf8", // <-- 替换为您自己的 Project ID
+        storageBucket: "my-project-93cf8.firebasestorage.app",
+        messagingSenderId: "895298236924",
+        appId: "1:895298236924:web:9293fc8b56316fd7c24279"
+        // measurementId: "G-SK2C8VKJEY" // measurementId 可选，用于 GitHub 部署时可以省略。
+    };
+
+    // 决定使用的 Firebase 配置：优先使用 Canvas 注入的配置，否则使用用户配置
+    const firebaseConfig = typeof __firebase_config !== 'undefined' 
+        ? JSON.parse(__firebase_config) 
+        : USER_FIREBASE_CONFIG;
+        
+    // App ID 决定 Firestore 路径
     const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-    const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
     const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
     let app, db, auth, userId = null;
@@ -54,9 +72,15 @@
 
     // Firebase Initialization Function
     async function initializeFirebase() {
-        if (!firebaseConfig) {
-            console.error("Firebase config is missing.");
-            document.getElementById('app').innerHTML = `<div class="p-8 text-center text-red-600">无法加载 Firebase 配置。</div>`;
+        // 检查用户是否需要更新配置以进行公共部署 (这里检查 projectId 是否已替换)
+        if (firebaseConfig.projectId === "YOUR_PROJECT_ID") {
+            console.error("Firebase config is missing or using placeholder keys.");
+            document.getElementById('app').innerHTML = `<div class="flex-grow flex items-center justify-center p-4">
+                <div class="w-full max-w-md p-8 bg-white rounded-xl card-shadow text-center text-red-600">
+                    <h2 class="text-2xl font-bold mb-4">🚨 Firebase 配置缺失 🚨</h2>
+                    <p class="text-gray-700">请在 index.html 文件中，使用您自己的 Firebase 项目配置替换 <code>USER_FIREBASE_CONFIG</code> 变量中的占位符。</p>
+                </div>
+            </div>`;
             return;
         }
         
@@ -65,11 +89,11 @@
         auth = getAuth(app);
         
         try {
-            // Sign in using custom token or anonymously based on environment
+            // Sign in using custom token (Canvas) or anonymously (public deployment fallback)
             if (initialAuthToken) {
                 await signInWithCustomToken(auth, initialAuthToken);
             } else {
-                await signInAnonymously(auth);
+                await signInAnonymously(auth); // 公开部署时使用匿名登录
             }
         } catch (error) {
             console.error("Firebase Authentication Error:", error);
