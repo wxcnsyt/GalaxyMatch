@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>缘分星河 (GalaxyMatch)</title>
+    <!-- Load Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Inter Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        /* Base font and background */
+        body { font-family: 'Inter', sans-serif; background-color: #f7f9fb; }
+        /* Custom shadow for cards */
+        .card-shadow { box-shadow: 0 10px 30px rgba(45, 55, 72, 0.1); }
+        /* Styling for the profile card with fallback image */
+        .match-card {
+            min-height: 500px;
+            background-image: url('https://placehold.co/400x500/A0BFFF/ffffff?text=Profile+Photo'); 
+            background-size: cover;
+            background-position: center;
+        }
+    </style>
+</head>
+<body>
+
+<div id="app" class="min-h-screen flex flex-col">
+    <!-- Application content is rendered here -->
+</div>
+
+<script type="module">
+    // --- Firebase Imports (Mandatory for persistence) ---
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, doc, getDoc, setDoc, collection, onSnapshot, updateDoc, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+    
+    // --- Global Variables and Firebase Init Setup ---
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+    const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+    let app, db, auth, userId = null;
+    let profilesCollectionRef = null;
+    
+    // Global State Management
+    let state = {
+        isAuthReady: false,
+        currentPage: 'loading', 
+        currentUser: null,
+        allProfiles: [], // Profiles available for swiping/matching
+        matchedProfiles: [], // Profiles that liked current user (for 'Who Likes You' feature)
+        currentViewingIndex: 0,
+    };
+
+    // Firebase Initialization Function
+    async function initializeFirebase() {
+        if (!firebaseConfig) {
+            console.error("Firebase config is missing.");
+            document.getElementById('app').innerHTML = `<div class="p-8 text-center text-red-600">无法加载 Firebase 配置。</div>`;
+            return;
+        }
+        
+        app = initializeApp(firebaseConfig);
+        db = getFirestore(app);
+        auth = getAuth(app);
+        
+        try {
+            // Sign in using custom token or anonymously based on environment
+            if (initialAuthToken) {
+                await signInWithCustomToken(auth, initialAuthToken);
+            } else {
+                await signInAnonymously(auth);
+            }
+        } catch (error) {
+            console.error("Firebase Authentication Error:", error);
+            document.getElementById('app').innerHTML = `<div class="p-8 text-center text-red-600">身份验证失败，请刷新重试。</div>`;
+            return;
+        }
+
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                userId = user.uid;
+                // Private data storage path 
+                profilesCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/galaxymatch_profiles`);
+                console.log("Authenticated with UID:", userId);
+                state.isAuthReady = true;
+                
+                listenToCurrentUserProfile();
+                listenToAllProfiles();
+            } else {
+                state.isAuthReady = true;
+                state.currentPage = 'login';
+                renderApp();
+            }
+        });
+    }
+
+    // --- Firestore Listeners ---
+
+    // Listen for changes to the current user's profile document
+    function listenToCurrentUserProfile() {
+        if (!userId) return;
+
+        const userDocRef = doc(profilesCollectionRef, userId);
+        onSnapshot(userDocRef, (docSnap) => {
+            if (docSnap.exists()) {
+                state.currentUser = { id: userId, ...docSnap.data() };
+                // Handle initial page routing based on profile completion
+                if (state.currentUser.profileComplete && state.currentPage === 'login') {
+                    state.currentPage = 'match';
+                } else if (!state.currentUser.profileComplete) {
+                    state.currentPage = 'profile';
+                }
+            } else {
+                state.currentUser = null;
+                state.currentPage = 'login';
+            }
+            renderApp();
+        }, (error) => {
+            console.error("Error listening to user profile:", error);
+        });
+    }
+
+    // Listen to all profiles in the collection (to find matches)
+    function listenToAllProfiles() {
+        if (!profilesCollectionRef) return;
+        
+        onSnapshot(profilesCollectionRef, (snapshot) => {
+            const all = [];
+            const likedByMe = state.currentUser?.likes || [];
+            const matches = state.currentUser?.matches || [];
+            const currentLikes = []; // Used for the "Who Likes You" page
+
+            snapshot.forEach(doc => {
+                if (doc.id !== userId) {
+                    const profile = { id: doc.id, ...doc.data() };
+                    
+                    // Profiles that have liked me (potential matches for 'likes' page)
+                    if (profile.likes && profile.likes.includes(userId) && !matches.includes(profile.id)) {
+                        currentLikes.push(profile);
+                    }
+
+                    // Filter out profiles I've already interacted with (liked or matched) for the main match deck
+                    if (!likedByMe.includes(profile.id) && !matches.includes(profile.id)) {
+                        all.push(profile);
+                    }
+                }
+            });
+
+            // Sort by Match Score (higher score = better match recommendation)
+            state.allProfiles = all.sort((a, b) => getMatchScore(b) - getMatchScore(a));
+            state.matchedProfiles = currentLikes;
+            state.currentViewingIndex = 0; // Reset index to show the top new profile
+            renderApp();
+        }, (error) => {
+            console.error("Error listening to all profiles:", error);
+        });
+    }
+
+    // --- Match Algorithm (Simplified W3 - Worldview/Three Views) ---
+
+    // Calculates score based on the number of identical answers in the Q&A section
+    function getMatchScore(targetProfile) {
+        if (!state.currentUser || !state.currentUser.qna || !targetProfile.qna) return 0;
+
+        let score = 0;
+        const userQna = state.currentUser.qna;
+        const targetQna = targetProfile.qna;
+        // Check for matching answers across the 6 questions
+        for (const key in userQna) {
+            if (userQna[key] === targetQna[key]) {
+                score++;
+            }
+        }
+        return score; 
+    }
+
+
+    // --- Core Actions ---
+
+    async function handleLike(targetId) {
+        if (!state.currentUser || !targetId) return;
+
+        const userDocRef = doc(profilesCollectionRef, userId);
+        const targetDocRef = doc(profilesCollectionRef, targetId);
+
+        // 1. Update my 'likes' list
+        await updateDoc(userDocRef, {
+            likes: arrayUnion(targetId)
+        });
+
+        // 2. Check for Match (did they already like me?)
+        const targetSnap = await getDoc(targetDocRef);
+        const targetLikes = targetSnap.data()?.likes || [];
+
+        if (targetLikes.includes(userId)) {
+            // It's a MATCH! Remove from likes and add to matches for both users.
+            await updateDoc(userDocRef, {
+                matches: arrayUnion(targetId),
+                likes: arrayRemove(targetId) 
+            });
+            await updateDoc(targetDocRef, {
+                matches: arrayUnion(userId),
+                likes: arrayRemove(userId) 
+            });
+            console.log(`🎉 MATCH: You matched with ${targetSnap.data().nickname}!`);
+            // Optional: Display a match modal here instead of just logging
+        } 
+        
+        // Move to next profile
+        state.currentViewingIndex = 0; 
+        renderApp();
+    }
+
+    async function handleSkip() {
+        // Move to the next profile locally
+        state.currentViewingIndex++;
+        renderApp();
+    }
+
+    async function saveProfile() {
+        const form = document.getElementById('profile-form');
+        // Basic Profile Info
+        const nickname = form.nickname.value;
+        const age = parseInt(form.age.value);
+        const gender = form.gender.value;
+        const lookingFor = form.lookingFor.value;
+        
+        // W3 Q&A Info
+        const qna = {};
+        const qnaQuestions = ['q1_money', 'q2_children', 'q3_work', 'q4_social', 'q5_conflict', 'q6_pace'];
+        let allQnaAnswered = true;
+        
+        qnaQuestions.forEach(id => {
+            const answer = form.elements[id].value;
+            if (!answer) allQnaAnswered = false;
+            qna[id] = answer;
+        });
+
+        if (!allQnaAnswered) {
+            console.error('请回答所有三观问答题以完成档案!');
+            // In a real app, display a custom modal message to the user here.
+            return;
+        }
+
+        const profileData = {
+            nickname,
+            age,
+            gender,
+            lookingFor,
+            qna,
+            profileComplete: true,
+            // Simple text placeholder for the profile photo
+            photoUrl: `https://placehold.co/400x500/A0BFFF/ffffff?text=${nickname.substring(0, 1)}`, 
+            likes: state.currentUser?.likes || [],
+            matches: state.currentUser?.matches || [],
+            isVIP: state.currentUser?.isVIP || false, // Mock VIP status
+        };
+
+        try {
+            const userDocRef = doc(profilesCollectionRef, userId);
+            // Use setDoc to create or overwrite the user's profile document
+            await setDoc(userDocRef, profileData);
+            console.log('Profile saved successfully!');
+            // The listener (onSnapshot) will automatically handle the page transition
+        } catch (error) {
+            console.error("Error saving profile:", error);
+        }
+    }
+    
+    // --- Event Handlers and Listeners ---
+    
+    function handleProfileSubmit(e) {
+        e.preventDefault();
+        saveProfile();
+    }
+
+    function attachListeners() {
+        // Attach listener only when the profile page is active
+        if (state.currentPage === 'profile') {
+            const form = document.getElementById('profile-form');
+            if (form) {
+                form.removeEventListener('submit', handleProfileSubmit); 
+                form.addEventListener('submit', handleProfileSubmit);
+            }
+        }
+    }
+
+    // --- Router and View Renderer ---
+
+    function renderApp() {
+        const appContainer = document.getElementById('app');
+        let content = '';
+        
+        // Ensure user completes profile before accessing main features
+        const currentPage = state.currentUser?.profileComplete ? state.currentPage : 'profile';
+
+        switch (currentPage) {
+            case 'loading':
+                content = renderLoading();
+                break;
+            case 'login':
+                content = renderLogin();
+                break;
+            case 'profile':
+                content = renderProfile();
+                break;
+            case 'match':
+                content = renderMatchDashboard();
+                break;
+            case 'chat':
+                content = renderChatList();
+                break;
+            case 'likes':
+                content = renderWhoLikesYou();
+                break;
+            default:
+                content = renderLoading();
+        }
+
+        // Render Navbar and the current page content
+        appContainer.innerHTML = renderNavbar() + content;
+        attachListeners(); 
+    }
+
+    // --- View Rendering Functions ---
+
+    function renderLoading() {
+        return `
+            <div class="flex-grow flex items-center justify-center p-8">
+                <div class="text-center">
+                    <div class="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-indigo-500 mx-auto"></div>
+                    <p class="mt-4 text-gray-600">星河正在加载...</p>
+                </div>
+            </div>
+        `;
+    }
+
+    function renderNavbar() {
+        if (!state.isAuthReady || state.currentPage === 'loading') return '';
+
+        const navItems = [
+            { id: 'match', label: '✨ 核心推荐', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
+            { id: 'likes', label: '💌 谁喜欢我', icon: 'M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z' },
+            { id: 'chat', label: '💬 消息中心', icon: 'M7 8h10M7 12h4m-4 8l4-4h4a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v10a2 2 0 002 2h2a2 2 0 012 2z' },
+            { id: 'profile', label: '👤 我的档案', icon: 'M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z' },
+        ];
+
+        return `
+            <nav class="bg-white card-shadow sticky top-0 z-10">
+                <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                    <div class="flex items-center justify-between h-16">
+                        <div class="flex-shrink-0 text-xl font-bold text-indigo-600">
+                            缘分星河
+                        </div>
+                        <div class="flex space-x-2 md:space-x-4">
+                            ${navItems.map(item => `
+                                <button onclick="window.setPage('${item.id}')"
+                                    class="py-2 px-3 rounded-xl transition duration-150 ease-in-out 
+                                    ${state.currentPage === item.id ? 'bg-indigo-500 text-white shadow-lg' : 'text-gray-600 hover:bg-gray-100'}">
+                                    <svg class="w-6 h-6 inline-block md:mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="${item.icon}"></path></svg>
+                                    <span class="hidden md:inline">${item.label}</span>
+                                </button>
+                            `).join('')}
+                        </div>
+                    </div>
+                </div>
+            </nav>
+        `;
+    }
+
+    function renderLogin() {
+        return `
+            <div class="flex-grow flex items-center justify-center p-4">
+                <div class="w-full max-w-md p-8 bg-white rounded-xl card-shadow text-center">
+                    <h2 class="text-3xl font-bold text-indigo-600 mb-6">欢迎来到 缘分星河</h2>
+                    <p class="text-gray-600 mb-8">开始一段认真、高质量的关系。请先创建您的个人档案。</p>
+                    <button onclick="window.setPage('profile')"
+                        class="w-full py-3 px-4 bg-indigo-600 text-white font-semibold rounded-xl hover:bg-indigo-700 transition duration-150">
+                        开始创建档案
+                    </button>
+                    <p class="mt-4 text-sm text-gray-500">用户ID: ${userId || 'N/A'}</p>
+                </div>
+            </div>
+        `;
+    }
+
+    function renderProfile() {
+        const user = state.currentUser || {};
+        const isComplete = user.profileComplete;
+
+        // Structured Q&A for W3 matching
+        const qnaQuestions = [
+            { id: 'q1_money', text: 'Q1: 你认为家庭开支是否需要完全透明？', options: ['是，必须透明', '否，保留个人空间', '弹性协商'] },
+            { id: 'q2_children', text: 'Q2: 你理想的子女数量是？', options: ['无', '一个', '两个', '随缘'] },
+            { id: 'q3_work', text: 'Q3: 工作与生活的平衡，你更倾向于？', options: ['工作优先', '生活优先', '严格平衡'] },
+            { id: 'q4_social', text: 'Q4: 你对伴侣的异性社交频率态度是？', options: ['无限制，信任', '需报备', '有限制', '完全不能接受'] },
+            { id: 'q5_conflict', text: 'Q5: 面对重大矛盾，你的首要处理方式是？', options: ['冷静独处，事后沟通', '立即沟通，直到解决', '寻求第三方意见'] },
+            { id: 'q6_pace', text: 'Q6: 你更享受哪种生活状态？', options: ['明确目标，全力拼搏', '慢节奏，享受当下', '灵活多变'] },
+        ];
+
+        return `
+            <div class="flex-grow max-w-3xl mx-auto p-4 md:p-8">
+                <div class="bg-white p-6 md:p-10 rounded-xl card-shadow">
+                    <h2 class="text-2xl font-bold text-indigo-600 mb-4">${isComplete ? '编辑' : '创建'}个人档案</h2>
+                    <p class="text-sm text-gray-500 mb-6">请填写档案并完成三观问答，才能被推荐给其他用户。</p>
+                    
+                    <form id="profile-form">
+                        <!-- Basic Info Section -->
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+                            <div>
+                                <label class="block text-gray-700 font-medium mb-1">昵称</label>
+                                <input id="nickname" name="nickname" type="text" value="${state.currentUser?.nickname || ''}" required 
+                                    class="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                            </div>
+                            <div>
+                                <label class="block text-gray-700 font-medium mb-1">年龄</label>
+                                <input id="age" name="age" type="number" value="${state.currentUser?.age || ''}" required min="18" max="99"
+                                    class="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                            </div>
+                            <div>
+                                <label class="block text-gray-700 font-medium mb-1">性别</label>
+                                <select id="gender" name="gender" required class="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                                    <option value="" disabled ${!state.currentUser?.gender ? 'selected' : ''}>请选择</option>
+                                    <option value="male" ${state.currentUser?.gender === 'male' ? 'selected' : ''}>男</option>
+                                    <option value="female" ${state.currentUser?.gender === 'female' ? 'selected' : ''}>女</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-gray-700 font-medium mb-1">正在寻找</label>
+                                <select id="lookingFor" name="lookingFor" required class="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                                    <option value="" disabled ${!state.currentUser?.lookingFor ? 'selected' : ''}>请选择</option>
+                                    <option value="male" ${state.currentUser?.lookingFor === 'male' ? 'selected' : ''}>男性</option>
+                                    <option value="female" ${state.currentUser?.lookingFor === 'female' ? 'selected' : ''}>女性</option>
+                                    <option value="both" ${state.currentUser?.lookingFor === 'both' ? 'selected' : ''}>不限</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Three Views (W3) Q&A Section -->
+                        <h3 class="text-xl font-bold text-gray-800 border-b pb-2 mb-4">三观问答 (W3 核心)</h3>
+                        ${qnaQuestions.map(q => `
+                            <div class="mb-5 p-4 border border-gray-200 rounded-lg bg-gray-50">
+                                <label class="block text-gray-700 font-semibold mb-2">${q.text}</label>
+                                <div class="space-y-2">
+                                    ${q.options.map(opt => `
+                                        <label class="inline-flex items-center">
+                                            <input type="radio" name="${q.id}" value="${opt}" required 
+                                                class="form-radio h-4 w-4 text-indigo-600" 
+                                                ${state.currentUser?.qna && state.currentUser.qna[q.id] === opt ? 'checked' : ''}>
+                                            <span class="ml-2 text-gray-600">${opt}</span>
+                                        </label>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        `).join('')}
+                        
+                        <button type="submit"
+                            class="w-full py-3 mt-4 bg-green-500 text-white font-semibold rounded-xl hover:bg-green-600 transition duration-150">
+                            ${isComplete ? '保存档案并进入星河' : '完成档案并进入星河'}
+                        </button>
+                        ${isComplete ? `<p class="mt-4 text-sm text-green-600 font-bold text-center">档案已完成！</p>` : ''}
+                    </form>
+                </div>
+            </div>
+        `;
+    }
+
+    function renderMatchDashboard() {
+        const currentProfile = state.allProfiles[state.currentViewingIndex];
+
+        if (!currentProfile) {
+            return `
+                <div class="flex-grow flex items-center justify-center p-8">
+                    <div class="text-center w-full max-w-md bg-white p-8 rounded-xl card-shadow">
+                        <h3 class="text-2xl font-bold text-gray-800 mb-4">今日推荐已浏览完毕</h3>
+                        <p class="text-gray-600">请耐心等待新的缘分出现，或升级 VIP 查看更多机会。</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        const matchScore = getMatchScore(currentProfile);
+        const matchPercentage = Math.round((matchScore / 6) * 100);
+        
+        return `
+            <div class="flex-grow flex items-center justify-center p-4">
+                <div class="w-full max-w-lg">
+                    <div class="match-card rounded-xl card-shadow relative overflow-hidden" 
+                        style="background-image: url('${currentProfile.photoUrl}')">
+                        
+                        <!-- Core Info Overlay -->
+                        <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-black/30 to-transparent p-6 flex flex-col justify-end">
+                            <h2 class="text-3xl font-bold text-white">${currentProfile.nickname}, ${currentProfile.age}</h2>
+                            <p class="text-white/80 mb-4">${currentProfile.gender === 'male' ? '男性' : '女性'} | ${matchScore} 项三观相似</p>
+                            
+                            <!-- Match Badge -->
+                            <div class="bg-indigo-500 text-white font-bold px-3 py-1 rounded-full w-fit mb-4 text-sm shadow-md">
+                                缘分指数: ${matchPercentage}%
+                            </div>
+                            
+                            <!-- Interaction Buttons -->
+                            <div class="flex justify-between space-x-4">
+                                <button onclick="window.handleSkipAndNext()"
+                                    class="flex-1 py-3 bg-red-500 text-white font-semibold rounded-full hover:bg-red-600 transition duration-150 transform hover:scale-105">
+                                    ❌ 跳过
+                                </button>
+                                <button onclick="window.handleLikeAndNext('${currentProfile.id}')"
+                                    class="flex-1 py-3 bg-green-500 text-white font-semibold rounded-full hover:bg-green-600 transition duration-150 transform hover:scale-105">
+                                    ❤️ 喜欢
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    // Helper function to handle 'Like' action and move to next profile
+    window.handleLikeAndNext = async (targetId) => {
+        await handleLike(targetId);
+        // The listener will update the profile list, and renderApp forces UI update.
+    };
+    
+    // Helper function to handle 'Skip' action and move to next profile
+    window.handleSkipAndNext = async () => {
+        await handleSkip();
+    };
+
+    function renderChatList() {
+        const matches = state.currentUser?.matches || [];
+        
+        if (matches.length === 0) {
+            return `
+                <div class="flex-grow flex items-center justify-center p-8">
+                    <div class="text-center w-full max-w-md bg-white p-8 rounded-xl card-shadow">
+                        <h3 class="text-2xl font-bold text-gray-800 mb-4">消息中心</h3>
+                        <p class="text-gray-600">您还没有配对成功的对象，去“核心推荐”开始一段缘分吧！</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        return `
+            <div class="flex-grow max-w-4xl mx-auto p-4 md:p-8">
+                <h2 class="text-2xl font-bold text-indigo-600 mb-6">💬 配对列表 (${matches.length} 个 Match)</h2>
+                <div class="space-y-4">
+                    ${matches.map(matchId => {
+                        // Find profile details from combined list for display
+                        const profile = state.allProfiles.find(p => p.id === matchId) || 
+                            state.matchedProfiles.find(p => p.id === matchId) ||
+                            {nickname: '未知用户', photoUrl: 'https://placehold.co/60x60/cccccc/ffffff?text=?'};
+                        return `
+                            <div class="flex items-center p-4 bg-white rounded-xl card-shadow hover:bg-gray-50 transition duration-150">
+                                <img src="${profile.photoUrl}" onerror="this.onerror=null; this.src='https://placehold.co/60x60/cccccc/ffffff?text=?'" class="w-16 h-16 object-cover rounded-full mr-4">
+                                <div class="flex-grow">
+                                    <p class="text-lg font-semibold text-gray-800">${profile.nickname}</p>
+                                    <p class="text-sm text-green-500 font-medium">✨ 已配对成功</p>
+                                </div>
+                                <button onclick="console.log('Entering chat with ${profile.nickname}')" class="bg-indigo-500 text-white px-4 py-2 rounded-lg text-sm hover:bg-indigo-600">
+                                    开始聊天
+                                </button>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+            </div>
+        `;
+    }
+
+    function renderWhoLikesYou() {
+        const likes = state.matchedProfiles;
+        const isVIP = state.currentUser?.isVIP; // VIP status is currently mocked as false
+
+        if (!isVIP) {
+            return `
+                <div class="flex-grow flex items-center justify-center p-8">
+                    <div class="text-center w-full max-w-md bg-white p-8 rounded-xl card-shadow">
+                        <h3 class="text-2xl font-bold text-indigo-600 mb-4">🔓 谁喜欢我 (VIP Star 专属)</h3>
+                        <p class="text-gray-600 mb-6">有 **${likes.length}** 位用户对您表示了兴趣！</p>
+                        <!-- Blurred placeholders for profiles -->
+                        <div class="flex justify-center -space-x-4 mb-8">
+                            ${likes.slice(0, 5).map(() => `
+                                <img src="https://placehold.co/60x60/312e81/ffffff?text=?" class="w-12 h-12 object-cover rounded-full border-4 border-white filter blur-md">
+                            `).join('')}
+                        </div>
+                        <button onclick="console.log('Upgrade to VIP Star to unlock likes!')"
+                            class="w-full py-3 bg-yellow-500 text-white font-semibold rounded-xl hover:bg-yellow-600 transition duration-150">
+                            升级 VIP Star 解锁 (￥99/月)
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+        
+        // VIP View (Unlocks if isVIP is true)
+        return `
+            <div class="flex-grow max-w-4xl mx-auto p-4 md:p-8">
+                <h2 class="text-2xl font-bold text-indigo-600 mb-6">💌 喜欢您的用户 (${likes.length} 位)</h2>
+                <p class="text-sm text-gray-500 mb-4">作为 VIP Star 会员，您可以直接查看并决定是否喜欢他们。</p>
+                <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+                    ${likes.map(profile => `
+                        <div class="bg-white p-4 rounded-xl card-shadow text-center">
+                            <img src="${profile.photoUrl}" onerror="this.onerror=null; this.src='https://placehold.co/150x180/A0BFFF/ffffff?text=${profile.nickname.substring(0, 1)}'" class="w-full h-40 object-cover rounded-lg mb-3">
+                            <p class="font-semibold text-gray-800">${profile.nickname}, ${profile.age}</p>
+                            <button onclick="window.handleLikeAndNext('${profile.id}')"
+                                class="w-full mt-2 py-2 bg-pink-500 text-white rounded-lg text-sm hover:bg-pink-600">
+                                ❤️ 喜欢 TA
+                            </button>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
+        `;
+    }
+
+    // --- Global Functions (exposed to HTML for click events) ---
+    window.setPage = (pageId) => {
+        state.currentPage = pageId;
+        renderApp();
+    };
+
+    // --- Initial Call ---
+    window.onload = initializeFirebase;
+</script>
+</body>
+</html>
